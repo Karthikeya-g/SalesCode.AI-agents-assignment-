@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentServer,
-    AgentSession,
+    AgentSessio,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
