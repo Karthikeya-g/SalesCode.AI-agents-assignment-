@@ -1,1 +1,40 @@
+# 🎙️ Intelligent Interruption Handling for LiveKit Agents
 
+### A Context-Aware Voice Agent That "Listens" While Speaking
+
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue) ![LiveKit](https://img.shields.io/badge/LiveKit-Agents-purple) ![Status](https://img.shields.io/badge/Status-Logic%20Verified-success)
+
+## 📖 Overview
+This repository contains a solution for the **LiveKit Agent Interruption Challenge**. 
+
+Standard Voice Activity Detection (VAD) often creates a robotic user experience by triggering interruptions on every sound. This project implements a **Logic Middleware Layer** that solves the "barge-in" problem. It allows the agent to distinguish between **passive backchanneling** (e.g., *"Yeah"*, *"Uh-huh"*) and **active interruptions** (e.g., *"Wait"*, *"Stop"*).
+
+---
+
+## 🧠 How It Works (The Logic Layer)
+
+Instead of relying solely on energy-based VAD (which is binary: Silence/Speech), this agent uses a **Semantic Interruption Handler** that inspects the real-time transcription stream.
+
+### 1. Architecture
+* **Turn Detection:** Default automatic turn detection is **disabled** (`turn_detection=None`). This gives us full manual control over the conversation flow.
+* **Stream Monitoring:** We listen to the `user_transcription_received` event stream. This allows us to make decisions *during* the user's speech, ensuring low latency (~300ms).
+* **State Filtering:** The interruption logic is only active when the agent is **Speaking**. If the agent is **Silent**, all input is treated as a valid conversational turn.
+
+### 2. The Logic Matrix
+The `InterruptionHandler` class enforces the following rules:
+
+| 🗣️ Agent State | 👤 User Input | 🤖 System Action | 📝 Reasoning |
+| :--- | :--- | :--- | :--- |
+| **Speaking** | *"Yeah", "Uh-huh", "Okay"* | **🟢 IGNORE** | Passive listening. The agent continues speaking seamlessly. |
+| **Speaking** | *"Wait", "Stop", "No"* | **🔴 INTERRUPT** | Semantic command detected. The agent yields immediately. |
+| **Speaking** | *"Yeah wait a second"* | **🔴 INTERRUPT** | Mixed input contains a command ("wait"). |
+| **Silent** | *"Yeah"* | **🔵 RESPOND** | Valid turn-taking. The agent processes the acknowledgement and replies. |
+
+### 3. Configurable Ignore List
+The logic uses a centralized, easily editable set of "safe words" that handle common Speech-to-Text punctuation variations:
+```python
+IGNORE_WORDS = {
+    "yeah", "yep", "yes", "ok", "okay", "alright", 
+    "hmm", "mhm", "aha", "uh-huh", "uhhuh", "mm-hm", 
+    "right", "sure", "correct", "yea", "oka"
+}
