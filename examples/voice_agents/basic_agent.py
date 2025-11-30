@@ -15,20 +15,58 @@ from livekit.agents import (
     room_io,
 )
 from livekit.agents.llm import function_tool
-from livekit.plugins import silero
-
-# NOTE: We removed MultilingualModel from imports because we are handling turns manually
-# from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins import silero, deepgram, openai
 
 logger = logging.getLogger("basic-agent")
 load_dotenv()
 
-# --- 1. CONFIGURATION: IGNORE LIST ---
+# --- REQ[cite: 37, 78]: CONFIGURABLE IGNORE LIST ---
+# Modular list that can be easily edited.
+# We include variations of backchannel words to handle STT instability.
 IGNORE_WORDS = {
     "yeah", "yep", "yes", "ok", "okay", "alright", 
-    "hmm", "mhm", "aha", "uh-huh", "right", "sure",
-    "yea", "oka", "uh-huh", "uhhuh", "mhm", "mm-hm", "mmhm"
+    "hmm", "mhm", "aha", "uh-huh", "uhhuh", "mm-hm", 
+    "right", "sure", "correct", "yea", "oka"
 }
+
+# --- REQ: MODULAR LOGIC CLASS ---
+class InterruptionHandler:
+    """
+    Handles the logic layer for distinguishing between backchanneling
+    and active interruptions.
+    """
+    @staticmethod
+    def is_backchannel(text: str) -> bool:
+        """
+        Returns True if the input text contains ONLY words from the ignore list.
+        """
+        # Clean text: Remove punctuation and hyphens to standardize "uh-huh" -> "uh huh"
+        clean_text = text.replace("-", " ").translate(str.maketrans('', '', string.punctuation)).lower()
+        words = clean_text.split()
+        
+        if not words:
+            return True # Treat empty noise as safe
+            
+        # Check if ALL words are in the ignore list
+        # Logic: If set(words) is a subset of IGNORE_WORDS, it's a backchannel.
+        return set(words).issubset(IGNORE_WORDS)
+
+    @staticmethod
+    def should_interrupt(text: str, is_agent_speaking: bool) -> bool:
+        """
+        Decides if the agent should stop speaking based on the logic matrix.
+        REQ[cite: 16]: Logic Matrix Implementation.
+        """
+        if not is_agent_speaking:
+            return False # REQ[cite: 38]: Filter applies only when generating audio
+        
+        # If it is a backchannel (e.g., "Yeah"), DO NOT interrupt.
+        if InterruptionHandler.is_backchannel(text):
+            return False 
+            
+        # REQ[cite: 39]: Semantic Interruption. 
+        # If it's NOT a backchannel (contains other words like "Wait"), interrupt.
+        return True
 
 class MyAgent(Agent):
     def __init__(self) -> None:
@@ -38,14 +76,7 @@ class MyAgent(Agent):
         )
 
     async def on_enter(self):
-        self.session.generate_reply()
-
-    @function_tool
-    async def lookup_weather(
-        self, context: RunContext, location: str, latitude: str, longitude: str
-    ):
-        logger.info(f"Looking up weather for {location}")
-        return "sunny with a temperature of 70 degrees."
+        await self.session.generate_reply()
 
 server = AgentServer()
 
@@ -58,20 +89,17 @@ server.setup_fnc = prewarm
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     
-    # --- 2. INITIALIZE SESSION (MANUAL MODE) ---
+    # --- REQ[cite: 45]: Integration with existing framework ---
     session = AgentSession(
-        stt="deepgram/nova-3",
-        llm="openai/gpt-4o-mini",
-        tts="cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        stt=deepgram.STT(model="nova-3"),
+        llm=openai.LLM(model="gpt-4o-mini"),
+        tts=openai.TTS(),
         vad=ctx.proc.userdata["vad"],
         
-        # CRITICAL CHANGE: Set turn_detection to None.
-        # This disables the default "Stop on Speech" behavior.
-        # We will handle interruptions manually below.
-        turn_detection=None, 
-        
-        # We don't need preemptive generation if we control the flow manually
-        preemptive_generation=False,
+        # --- REQ[cite: 13, 41]: STRICT REQUIREMENT & NO VAD MOD ---
+        # We disable automatic turn detection to prevent the VAD from 
+        # stopping the agent on "Yeah". We will handle turns manually.
+        turn_detection=None,
     )
 
     usage_collector = metrics.UsageCollector()
@@ -81,39 +109,36 @@ async def entrypoint(ctx: JobContext):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
-    # --- 3. LOGIC LAYER: HANDLING INTERRUPTIONS ---
+    # --- REQ[cite: 46, 47]: TRANSCRIPTION LOGIC & FALSE START STRATEGY ---
     @session.on("user_transcription_received")
     def on_transcription(msg):
+        """
+        Stream handler to decide interruption in real-time (Low Latency REQ [cite: 49]).
+        """
         text = msg.content.strip()
         if not text: return
 
-        # ROBUST CLEANING: 
-        # 1. Replace hyphens with spaces (fixes "uh-huh" -> "uh huh")
-        # 2. Remove other punctuation
-        clean_text = text.replace("-", " ").translate(str.maketrans('', '', string.punctuation)).lower()
-        words = clean_text.split()
+        is_speaking = session.response_agent.is_speaking
+        
+        # Use our modular handler to decide
+        if InterruptionHandler.should_interrupt(text, is_speaking):
+            logger.info(f"🔴 INTERRUPT: Valid command detected -> '{text}'")
+            session.response_agent.interrupt()
+        elif is_speaking:
+            # REQ[cite: 32]: IGNORE behavior
+            logger.info(f"🟢 IGNORE: Backchannel detected -> '{text}'")
 
-        # Check for command
-        is_real_command = any(word not in IGNORE_WORDS for word in words)
-
-        if session.response_agent.is_speaking:
-            if is_real_command:
-                print(f"🔴 INTERRUPT: '{text}'")
-                session.response_agent.interrupt()
-            else:
-                # This log is crucial for debugging your assignment!
-                print(f"🟢 IGNORE: Backchannel detected '{text}'")
-
-    # --- 4. LOGIC LAYER: HANDLING REPLIES ---
+    # --- REQ[cite: 27, 34, 74]: STATE AWARENESS (Silent Response) ---
     @session.on("user_speech_committed")
     def on_user_speech_committed(msg):
-        # This runs when the user FINISHES a sentence.
-        # Since we disabled turn_detection, we must manually tell the agent to reply.
-        
-        # If the agent is NOT speaking, it means it's the user's turn.
+        """
+        Handler for when the user finishes a sentence.
+        If the agent is silent, we MUST reply, even if it was just "Yeah".
+        """
+        # Only reply if the agent isn't currently talking (normal turn-taking)
         if not session.response_agent.is_speaking:
-            logger.info("🔵 REPLY: User finished speaking, generating reply.")
-            # We trigger the reply manually
+            text = msg.content.strip()
+            logger.info(f"🔵 REPLY: User finished turn ('{text}'). Generating reply.")
             session.generate_reply()
 
     async def log_usage():
